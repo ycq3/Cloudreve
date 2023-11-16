@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/cloudreve/Cloudreve/v3/pkg/filesystem/driver"
 	"io"
 	"net/http"
 	"net/url"
@@ -41,7 +42,7 @@ type UploadPolicy struct {
 	Conditions []interface{} `json:"conditions"`
 }
 
-//MetaData 文件信息
+// MetaData 文件信息
 type MetaData struct {
 	Size uint64
 	Etag string
@@ -62,7 +63,7 @@ func NewDriver(policy *model.Policy) (*Driver, error) {
 // InitS3Client 初始化S3会话
 func (handler *Driver) InitS3Client() error {
 	if handler.Policy == nil {
-		return errors.New("存储策略为空")
+		return errors.New("empty policy")
 	}
 
 	if handler.svc == nil {
@@ -71,7 +72,7 @@ func (handler *Driver) InitS3Client() error {
 			Credentials:      credentials.NewStaticCredentials(handler.Policy.AccessKey, handler.Policy.SecretKey, ""),
 			Endpoint:         &handler.Policy.Server,
 			Region:           &handler.Policy.OptionsSerialized.Region,
-			S3ForcePathStyle: aws.Bool(true),
+			S3ForcePathStyle: &handler.Policy.OptionsSerialized.S3ForcePathStyle,
 		})
 
 		if err != nil {
@@ -163,14 +164,7 @@ func (handler *Driver) List(ctx context.Context, base string, recursive bool) ([
 // Get 获取文件
 func (handler *Driver) Get(ctx context.Context, path string) (response.RSCloser, error) {
 	// 获取文件源地址
-	downloadURL, err := handler.Source(
-		ctx,
-		path,
-		url.URL{},
-		int64(model.GetIntSetting("preview_timeout", 60)),
-		false,
-		0,
-	)
+	downloadURL, err := handler.Source(ctx, path, int64(model.GetIntSetting("preview_timeout", 60)), false, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -257,26 +251,19 @@ func (handler *Driver) Delete(ctx context.Context, files []string) ([]string, er
 	for _, deleteRes := range res.Deleted {
 		deleted = append(deleted, *deleteRes.Key)
 	}
-	failed = util.SliceDifference(failed, deleted)
+	failed = util.SliceDifference(files, deleted)
 
 	return failed, nil
 
 }
 
 // Thumb 获取文件缩略图
-func (handler *Driver) Thumb(ctx context.Context, path string) (*response.ContentResponse, error) {
-	return nil, errors.New("未实现")
+func (handler *Driver) Thumb(ctx context.Context, file *model.File) (*response.ContentResponse, error) {
+	return nil, driver.ErrorThumbNotSupported
 }
 
 // Source 获取外链URL
-func (handler *Driver) Source(
-	ctx context.Context,
-	path string,
-	baseURL url.URL,
-	ttl int64,
-	isDownload bool,
-	speed int,
-) (string, error) {
+func (handler *Driver) Source(ctx context.Context, path string, ttl int64, isDownload bool, speed int) (string, error) {
 
 	// 尝试从上下文获取文件名
 	fileName := ""
@@ -289,16 +276,16 @@ func (handler *Driver) Source(
 		return "", err
 	}
 
+	contentDescription := aws.String("attachment; filename=\"" + url.PathEscape(fileName) + "\"")
+	if !isDownload {
+		contentDescription = nil
+	}
 	req, _ := handler.svc.GetObjectRequest(
 		&s3.GetObjectInput{
 			Bucket:                     &handler.Policy.BucketName,
 			Key:                        &path,
-			ResponseContentDisposition: aws.String("attachment; filename=\"" + url.PathEscape(fileName) + "\""),
+			ResponseContentDisposition: contentDescription,
 		})
-
-	if ttl == 0 {
-		ttl = 3600
-	}
 
 	signedURL, err := req.Presign(time.Duration(ttl) * time.Second)
 	if err != nil {
@@ -339,9 +326,10 @@ func (handler *Driver) Token(ctx context.Context, ttl int64, uploadSession *seri
 	// 创建分片上传
 	expires := time.Now().Add(time.Duration(ttl) * time.Second)
 	res, err := handler.svc.CreateMultipartUpload(&s3.CreateMultipartUploadInput{
-		Bucket:  &handler.Policy.BucketName,
-		Key:     &fileInfo.SavePath,
-		Expires: &expires,
+		Bucket:      &handler.Policy.BucketName,
+		Key:         &fileInfo.SavePath,
+		Expires:     &expires,
+		ContentType: aws.String(fileInfo.DetectMimeType()),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to create multipart upload: %w", err)
@@ -398,8 +386,8 @@ func (handler *Driver) Token(ctx context.Context, ttl int64, uploadSession *seri
 
 // Meta 获取文件信息
 func (handler *Driver) Meta(ctx context.Context, path string) (*MetaData, error) {
-	res, err := handler.svc.GetObject(
-		&s3.GetObjectInput{
+	res, err := handler.svc.HeadObject(
+		&s3.HeadObjectInput{
 			Bucket: &handler.Policy.BucketName,
 			Key:    &path,
 		})

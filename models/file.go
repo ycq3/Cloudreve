@@ -4,7 +4,10 @@ import (
 	"encoding/gob"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"path"
+	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/cloudreve/Cloudreve/v3/pkg/util"
@@ -33,6 +36,18 @@ type File struct {
 	MetadataSerialized map[string]string `gorm:"-"`
 }
 
+// Thumb related metadata
+const (
+	ThumbStatusNotExist     = ""
+	ThumbStatusExist        = "exist"
+	ThumbStatusNotAvailable = "not_available"
+
+	ThumbStatusMetadataKey  = "thumb_status"
+	ThumbSidecarMetadataKey = "thumb_sidecar"
+
+	ChecksumMetadataKey = "webdav_checksum"
+)
+
 func init() {
 	// 注册缓存用到的复杂结构
 	gob.Register(File{})
@@ -43,7 +58,7 @@ func (file *File) Create() error {
 	tx := DB.Begin()
 
 	if err := tx.Create(file).Error; err != nil {
-		util.Log().Warning("无法插入文件记录, %s", err)
+		util.Log().Warning("Failed to insert file record: %s", err)
 		tx.Rollback()
 		return err
 	}
@@ -63,6 +78,8 @@ func (file *File) AfterFind() (err error) {
 	// 反序列化文件元数据
 	if file.Metadata != "" {
 		err = json.Unmarshal([]byte(file.Metadata), &file.MetadataSerialized)
+	} else {
+		file.MetadataSerialized = make(map[string]string)
 	}
 
 	return
@@ -70,9 +87,13 @@ func (file *File) AfterFind() (err error) {
 
 // BeforeSave Save策略前的钩子
 func (file *File) BeforeSave() (err error) {
-	metaValue, err := json.Marshal(&file.MetadataSerialized)
-	file.Metadata = string(metaValue)
-	return err
+	if len(file.MetadataSerialized) > 0 {
+		metaValue, err := json.Marshal(&file.MetadataSerialized)
+		file.Metadata = string(metaValue)
+		return err
+	}
+
+	return nil
 }
 
 // GetChildFile 查找目录下名为name的子文件
@@ -186,15 +207,20 @@ func RemoveFilesWithSoftLinks(files []File) ([]File, error) {
 	// 结果值
 	filteredFiles := make([]File, 0)
 
-	// 查询软链接的文件
-	var filesWithSoftLinks []File
-	tx := DB
-	for _, value := range files {
-		tx = tx.Or("source_name = ? and policy_id = ? and id != ?", value.SourceName, value.PolicyID, value.ID)
+	if len(files) == 0 {
+		return filteredFiles, nil
 	}
-	result := tx.Find(&filesWithSoftLinks)
-	if result.Error != nil {
-		return nil, result.Error
+
+	// 查询软链接的文件
+	filesWithSoftLinks := make([]File, 0)
+	for _, file := range files {
+		var softLinkFile File
+		res := DB.
+			Where("source_name = ? and policy_id = ? and id != ?", file.SourceName, file.PolicyID, file.ID).
+			First(&softLinkFile)
+		if res.Error == nil {
+			filesWithSoftLinks = append(filesWithSoftLinks, softLinkFile)
+		}
 	}
 
 	// 过滤具有软连接的文件
@@ -228,7 +254,7 @@ func DeleteFiles(files []*File, uid uint) error {
 	user.ID = uid
 	var size uint64
 	for _, file := range files {
-		if file.UserID != uid {
+		if uid > 0 && file.UserID != uid {
 			tx.Rollback()
 			return errors.New("user id not consistent")
 		}
@@ -247,9 +273,11 @@ func DeleteFiles(files []*File, uid uint) error {
 		size += file.Size
 	}
 
-	if err := user.ChangeStorage(tx, "-", size); err != nil {
-		tx.Rollback()
-		return err
+	if uid > 0 {
+		if err := user.ChangeStorage(tx, "-", size); err != nil {
+			tx.Rollback()
+			return err
+		}
 	}
 
 	return tx.Commit().Error
@@ -271,12 +299,41 @@ func GetFilesByUploadSession(sessionID string, uid uint) (*File, error) {
 
 // Rename 重命名文件
 func (file *File) Rename(new string) error {
-	return DB.Model(&file).UpdateColumn("name", new).Error
+	if file.MetadataSerialized[ThumbStatusMetadataKey] == ThumbStatusNotAvailable {
+		if !strings.EqualFold(filepath.Ext(new), filepath.Ext(file.Name)) {
+			// Reset thumb status for new ext name.
+			if err := file.resetThumb(); err != nil {
+				return err
+			}
+		}
+	}
+
+	return DB.Model(&file).Set("gorm:association_autoupdate", false).Updates(map[string]interface{}{
+		"name":     new,
+		"metadata": file.Metadata,
+	}).Error
 }
 
 // UpdatePicInfo 更新文件的图像信息
 func (file *File) UpdatePicInfo(value string) error {
 	return DB.Model(&file).Set("gorm:association_autoupdate", false).UpdateColumns(File{PicInfo: value}).Error
+}
+
+// UpdateMetadata 新增或修改文件的元信息
+func (file *File) UpdateMetadata(data map[string]string) error {
+	if file.MetadataSerialized == nil {
+		file.MetadataSerialized = make(map[string]string)
+	}
+
+	for k, v := range data {
+		file.MetadataSerialized[k] = v
+	}
+	metaValue, err := json.Marshal(&file.MetadataSerialized)
+	if err != nil {
+		return err
+	}
+
+	return DB.Model(&file).Set("gorm:association_autoupdate", false).UpdateColumns(File{Metadata: string(metaValue)}).Error
 }
 
 // UpdateSize 更新文件的大小信息
@@ -294,10 +351,18 @@ func (file *File) UpdateSize(value uint64) error {
 		sizeDelta = file.Size - value
 	}
 
+	if err := file.resetThumb(); err != nil {
+		tx.Rollback()
+		return err
+	}
+
 	if res := tx.Model(&file).
 		Where("size = ?", file.Size).
 		Set("gorm:association_autoupdate", false).
-		Update("size", value); res.Error != nil {
+		Updates(map[string]interface{}{
+			"size":     value,
+			"metadata": file.Metadata,
+		}); res.Error != nil {
 		tx.Rollback()
 		return res.Error
 	}
@@ -313,7 +378,14 @@ func (file *File) UpdateSize(value uint64) error {
 
 // UpdateSourceName 更新文件的源文件名
 func (file *File) UpdateSourceName(value string) error {
-	return DB.Model(&file).Set("gorm:association_autoupdate", false).Update("source_name", value).Error
+	if err := file.resetThumb(); err != nil {
+		return err
+	}
+
+	return DB.Model(&file).Set("gorm:association_autoupdate", false).Updates(map[string]interface{}{
+		"source_name": value,
+		"metadata":    file.Metadata,
+	}).Error
 }
 
 func (file *File) PopChunkToFile(lastModified *time.Time, picInfo string) error {
@@ -332,6 +404,36 @@ func (file *File) PopChunkToFile(lastModified *time.Time, picInfo string) error 
 // CanCopy 返回文件是否可被复制
 func (file *File) CanCopy() bool {
 	return file.UploadSessionID == nil
+}
+
+// CreateOrGetSourceLink creates a SourceLink model. If the given model exists, the existing
+// model will be returned.
+func (file *File) CreateOrGetSourceLink() (*SourceLink, error) {
+	res := &SourceLink{}
+	err := DB.Set("gorm:auto_preload", true).Where("file_id = ?", file.ID).Find(&res).Error
+	if err == nil && res.ID > 0 {
+		return res, nil
+	}
+
+	res.FileID = file.ID
+	res.Name = file.Name
+	if err := DB.Save(res).Error; err != nil {
+		return nil, fmt.Errorf("failed to insert SourceLink: %w", err)
+	}
+
+	res.File = *file
+	return res, nil
+}
+
+func (file *File) resetThumb() error {
+	if _, ok := file.MetadataSerialized[ThumbStatusMetadataKey]; !ok {
+		return nil
+	}
+
+	delete(file.MetadataSerialized, ThumbStatusMetadataKey)
+	metaValue, err := json.Marshal(&file.MetadataSerialized)
+	file.Metadata = string(metaValue)
+	return err
 }
 
 /*
@@ -355,4 +457,16 @@ func (file *File) IsDir() bool {
 
 func (file *File) GetPosition() string {
 	return file.Position
+}
+
+// ShouldLoadThumb returns if file explorer should try to load thumbnail for this file.
+// `True` does not guarantee the load request will success in next step, but the client
+// should try to load and fallback to default placeholder in case error returned.
+func (file *File) ShouldLoadThumb() bool {
+	return file.MetadataSerialized[ThumbStatusMetadataKey] != ThumbStatusNotAvailable
+}
+
+// return sidecar thumb file name
+func (file *File) ThumbFile() string {
+	return file.SourceName + GetSettingByNameWithDefault("thumb_file_suffix", "._thumb")
 }

@@ -8,6 +8,7 @@ import (
 	"github.com/cloudreve/Cloudreve/v3/pkg/conf"
 	"github.com/cloudreve/Cloudreve/v3/pkg/filesystem/driver"
 	"github.com/cloudreve/Cloudreve/v3/pkg/filesystem/driver/cos"
+	"github.com/cloudreve/Cloudreve/v3/pkg/filesystem/driver/googledrive"
 	"github.com/cloudreve/Cloudreve/v3/pkg/filesystem/driver/local"
 	"github.com/cloudreve/Cloudreve/v3/pkg/filesystem/driver/onedrive"
 	"github.com/cloudreve/Cloudreve/v3/pkg/filesystem/driver/oss"
@@ -176,6 +177,10 @@ func (fs *FileSystem) DispatchHandler() error {
 		handler, err := s3.NewDriver(currentPolicy)
 		fs.Handler = handler
 		return err
+	case "googledrive":
+		handler, err := googledrive.NewDriver(currentPolicy)
+		fs.Handler = handler
+		return err
 	default:
 		return ErrUnknownPolicyType
 	}
@@ -203,7 +208,7 @@ func NewFileSystemFromCallback(c *gin.Context) (*FileSystem, error) {
 	// 获取回调会话
 	callbackSessionRaw, ok := c.Get(UploadSessionCtx)
 	if !ok {
-		return nil, errors.New("找不到回调会话")
+		return nil, errors.New("upload session not exist")
 	}
 	callbackSession := callbackSessionRaw.(*serializer.UploadSession)
 

@@ -5,6 +5,10 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"net/http"
+	"net/url"
+	"time"
+
 	model "github.com/cloudreve/Cloudreve/v3/models"
 	"github.com/cloudreve/Cloudreve/v3/pkg/cache"
 	"github.com/cloudreve/Cloudreve/v3/pkg/cluster"
@@ -16,9 +20,6 @@ import (
 	"github.com/cloudreve/Cloudreve/v3/pkg/util"
 	"github.com/gin-gonic/gin"
 	"github.com/jinzhu/gorm"
-	"net/http"
-	"net/url"
-	"time"
 )
 
 // SlaveDownloadService 从机文件下載服务
@@ -31,6 +32,7 @@ type SlaveDownloadService struct {
 // SlaveFileService 从机单文件文件相关服务
 type SlaveFileService struct {
 	PathEncoded string `uri:"path" binding:"required"`
+	Ext         string `uri:"ext"`
 }
 
 // SlaveFilesService 从机多文件相关服务
@@ -131,7 +133,7 @@ func (service *SlaveFileService) Thumb(ctx context.Context, c *gin.Context) seri
 	if err != nil {
 		return serializer.Err(serializer.CodeFileNotFound, "", err)
 	}
-	fs.FileTarget = []model.File{{SourceName: string(fileSource), PicInfo: "1,1"}}
+	fs.FileTarget = []model.File{{SourceName: string(fileSource), Name: fmt.Sprintf("%s.%s", fileSource, service.Ext), PicInfo: "1,1"}}
 
 	// 获取缩略图
 	resp, err := fs.GetThumb(ctx, 0)

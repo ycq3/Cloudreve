@@ -17,6 +17,7 @@ import (
 	model "github.com/cloudreve/Cloudreve/v3/models"
 	"github.com/cloudreve/Cloudreve/v3/pkg/filesystem/chunk"
 	"github.com/cloudreve/Cloudreve/v3/pkg/filesystem/chunk/backoff"
+	"github.com/cloudreve/Cloudreve/v3/pkg/filesystem/driver"
 	"github.com/cloudreve/Cloudreve/v3/pkg/filesystem/fsctx"
 	"github.com/cloudreve/Cloudreve/v3/pkg/filesystem/response"
 	"github.com/cloudreve/Cloudreve/v3/pkg/request"
@@ -91,7 +92,7 @@ func (handler *Driver) CORS() error {
 // InitOSSClient 初始化OSS鉴权客户端
 func (handler *Driver) InitOSSClient(forceUsePublicEndpoint bool) error {
 	if handler.Policy == nil {
-		return errors.New("存储策略为空")
+		return errors.New("empty policy")
 	}
 
 	// 决定是否使用内网 Endpoint
@@ -193,14 +194,7 @@ func (handler *Driver) Get(ctx context.Context, path string) (response.RSCloser,
 	ctx = context.WithValue(ctx, fsctx.ForceUsePublicEndpointCtx, false)
 
 	// 获取文件源地址
-	downloadURL, err := handler.Source(
-		ctx,
-		path,
-		url.URL{},
-		int64(model.GetIntSetting("preview_timeout", 60)),
-		false,
-		0,
-	)
+	downloadURL, err := handler.Source(ctx, path, int64(model.GetIntSetting("preview_timeout", 60)), false, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -286,14 +280,25 @@ func (handler *Driver) Delete(ctx context.Context, files []string) ([]string, er
 	// 统计未删除的文件
 	failed := util.SliceDifference(files, delRes.DeletedObjects)
 	if len(failed) > 0 {
-		return failed, errors.New("删除失败")
+		return failed, errors.New("failed to delete")
 	}
 
 	return []string{}, nil
 }
 
 // Thumb 获取文件缩略图
-func (handler *Driver) Thumb(ctx context.Context, path string) (*response.ContentResponse, error) {
+func (handler *Driver) Thumb(ctx context.Context, file *model.File) (*response.ContentResponse, error) {
+	// quick check by extension name
+	// https://help.aliyun.com/document_detail/183902.html
+	supported := []string{"png", "jpg", "jpeg", "gif", "bmp", "webp", "heic", "tiff", "avif"}
+	if len(handler.Policy.OptionsSerialized.ThumbExts) > 0 {
+		supported = handler.Policy.OptionsSerialized.ThumbExts
+	}
+
+	if !util.IsInExtensionList(supported, file.Name) || file.Size > (20<<(10*2)) {
+		return nil, driver.ErrorThumbNotSupported
+	}
+
 	// 初始化客户端
 	if err := handler.InitOSSClient(true); err != nil {
 		return nil, err
@@ -304,15 +309,17 @@ func (handler *Driver) Thumb(ctx context.Context, path string) (*response.Conten
 		ok        = false
 	)
 	if thumbSize, ok = ctx.Value(fsctx.ThumbSizeCtx).([2]uint); !ok {
-		return nil, errors.New("无法获取缩略图尺寸设置")
+		return nil, errors.New("failed to get thumbnail size")
 	}
 
-	thumbParam := fmt.Sprintf("image/resize,m_lfit,h_%d,w_%d", thumbSize[1], thumbSize[0])
+	thumbEncodeQuality := model.GetIntSetting("thumb_encode_quality", 85)
+
+	thumbParam := fmt.Sprintf("image/resize,m_lfit,h_%d,w_%d/quality,q_%d", thumbSize[1], thumbSize[0], thumbEncodeQuality)
 	ctx = context.WithValue(ctx, fsctx.ThumbSizeCtx, thumbParam)
 	thumbOption := []oss.Option{oss.Process(thumbParam)}
 	thumbURL, err := handler.signSourceURL(
 		ctx,
-		path,
+		file.SourceName,
 		int64(model.GetIntSetting("preview_timeout", 60)),
 		thumbOption,
 	)
@@ -327,14 +334,7 @@ func (handler *Driver) Thumb(ctx context.Context, path string) (*response.Conten
 }
 
 // Source 获取外链URL
-func (handler *Driver) Source(
-	ctx context.Context,
-	path string,
-	baseURL url.URL,
-	ttl int64,
-	isDownload bool,
-	speed int,
-) (string, error) {
+func (handler *Driver) Source(ctx context.Context, path string, ttl int64, isDownload bool, speed int) (string, error) {
 	// 初始化客户端
 	usePublicEndpoint := true
 	if forceUsePublicEndpoint, ok := ctx.Value(fsctx.ForceUsePublicEndpointCtx).(bool); ok {
@@ -435,6 +435,7 @@ func (handler *Driver) Token(ctx context.Context, ttl int64, uploadSession *seri
 	options := []oss.Option{
 		oss.Expires(time.Now().Add(time.Duration(ttl) * time.Second)),
 		oss.ForbidOverWrite(true),
+		oss.ContentType(fileInfo.DetectMimeType()),
 	}
 	imur, err := handler.bucket.InitiateMultipartUpload(fileInfo.SavePath, options...)
 	if err != nil {

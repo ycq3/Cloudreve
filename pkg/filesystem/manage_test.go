@@ -3,13 +3,13 @@ package filesystem
 import (
 	"context"
 	"errors"
+	"github.com/DATA-DOG/go-sqlmock"
 	"os"
 	"testing"
 
 	"github.com/cloudreve/Cloudreve/v3/pkg/filesystem/response"
 	testMock "github.com/stretchr/testify/mock"
 
-	"github.com/DATA-DOG/go-sqlmock"
 	model "github.com/cloudreve/Cloudreve/v3/models"
 	"github.com/cloudreve/Cloudreve/v3/pkg/cache"
 	"github.com/cloudreve/Cloudreve/v3/pkg/conf"
@@ -472,6 +472,9 @@ func TestFileSystem_Delete(t *testing.T) {
 					AddRow(4, "1.txt", "1.txt", 365, 1),
 			)
 		mock.ExpectQuery("SELECT(.+)").WillReturnRows(sqlmock.NewRows([]string{"id", "name", "source_name", "policy_id", "size"}).AddRow(1, "2.txt", "2.txt", 365, 2))
+		// 两次查询软连接
+		mock.ExpectQuery("SELECT(.+)files(.+)").
+			WillReturnRows(sqlmock.NewRows([]string{"id", "policy_id", "source_name"}))
 		mock.ExpectQuery("SELECT(.+)files(.+)").
 			WillReturnRows(sqlmock.NewRows([]string{"id", "policy_id", "source_name"}))
 		// 查询上传策略
@@ -482,7 +485,6 @@ func TestFileSystem_Delete(t *testing.T) {
 			WillReturnResult(sqlmock.NewResult(0, 1))
 		mock.ExpectExec("DELETE(.+)").
 			WillReturnResult(sqlmock.NewResult(0, 1))
-		mock.ExpectExec("UPDATE(.+)users(.+)storage(.+)").WillReturnResult(sqlmock.NewResult(1, 1))
 		mock.ExpectCommit()
 		// 删除对应分享
 		mock.ExpectBegin()
@@ -502,7 +504,7 @@ func TestFileSystem_Delete(t *testing.T) {
 
 		fs.FileTarget = []model.File{}
 		fs.DirTarget = []model.Folder{}
-		err := fs.Delete(ctx, []uint{1}, []uint{1}, true)
+		err := fs.Delete(ctx, []uint{1}, []uint{1}, true, false)
 		asserts.NoError(err)
 	}
 	//全部成功
@@ -527,6 +529,9 @@ func TestFileSystem_Delete(t *testing.T) {
 					AddRow(4, "1.txt", "1.txt", 602, 1),
 			)
 		mock.ExpectQuery("SELECT(.+)").WillReturnRows(sqlmock.NewRows([]string{"id", "name", "source_name", "policy_id", "size"}).AddRow(1, "2.txt", "2.txt", 602, 2))
+		// 两次查询软连接
+		mock.ExpectQuery("SELECT(.+)files(.+)").
+			WillReturnRows(sqlmock.NewRows([]string{"id", "policy_id", "source_name"}))
 		mock.ExpectQuery("SELECT(.+)files(.+)").
 			WillReturnRows(sqlmock.NewRows([]string{"id", "policy_id", "source_name"}))
 		// 查询上传策略
@@ -537,7 +542,6 @@ func TestFileSystem_Delete(t *testing.T) {
 			WillReturnResult(sqlmock.NewResult(0, 1))
 		mock.ExpectExec("DELETE(.+)").
 			WillReturnResult(sqlmock.NewResult(0, 1))
-		mock.ExpectExec("UPDATE(.+)users(.+)storage(.+)").WillReturnResult(sqlmock.NewResult(1, 1))
 		mock.ExpectCommit()
 		// 删除对应分享
 		mock.ExpectBegin()
@@ -557,7 +561,7 @@ func TestFileSystem_Delete(t *testing.T) {
 
 		fs.FileTarget = []model.File{}
 		fs.DirTarget = []model.Folder{}
-		err = fs.Delete(ctx, []uint{1}, []uint{1}, false)
+		err = fs.Delete(ctx, []uint{1}, []uint{1}, false, false)
 		asserts.NoError(err)
 	}
 
@@ -678,7 +682,7 @@ func TestFileSystem_Rename(t *testing.T) {
 			WillReturnRows(sqlmock.NewRows([]string{"id", "name"}).AddRow(10, "old.text"))
 		mock.ExpectBegin()
 		mock.ExpectExec("UPDATE(.+)files(.+)SET(.+)").
-			WithArgs("new.txt", 10).
+			WithArgs(sqlmock.AnyArg(), "new.txt", sqlmock.AnyArg(), 10).
 			WillReturnResult(sqlmock.NewResult(1, 1))
 		mock.ExpectCommit()
 		err := fs.Rename(ctx, []uint{}, []uint{10}, "new.txt")
@@ -704,7 +708,7 @@ func TestFileSystem_Rename(t *testing.T) {
 			WillReturnRows(sqlmock.NewRows([]string{"id", "name"}).AddRow(10, "old.text"))
 		mock.ExpectBegin()
 		mock.ExpectExec("UPDATE(.+)files(.+)SET(.+)").
-			WithArgs("new.txt", 10).
+			WithArgs(sqlmock.AnyArg(), "new.txt", sqlmock.AnyArg(), 10).
 			WillReturnError(errors.New("error"))
 		mock.ExpectRollback()
 		err := fs.Rename(ctx, []uint{}, []uint{10}, "new.txt")

@@ -10,6 +10,7 @@ import (
 	"github.com/cloudreve/Cloudreve/v3/pkg/email"
 	"github.com/cloudreve/Cloudreve/v3/pkg/request"
 	"github.com/cloudreve/Cloudreve/v3/pkg/serializer"
+	"github.com/cloudreve/Cloudreve/v3/pkg/wopi"
 	"github.com/cloudreve/Cloudreve/v3/service/admin"
 	"github.com/gin-gonic/gin"
 )
@@ -79,6 +80,8 @@ func AdminReloadService(c *gin.Context) {
 		email.Init()
 	case "aria2":
 		aria2.Init(true, cluster.Default, mq.GlobalMQ)
+	case "wopi":
+		wopi.Init()
 	}
 
 	c.JSON(200, serializer.Response{})
@@ -89,6 +92,17 @@ func AdminSendTestMail(c *gin.Context) {
 	var service admin.MailTestService
 	if err := c.ShouldBindJSON(&service); err == nil {
 		res := service.Send()
+		c.JSON(200, res)
+	} else {
+		c.JSON(200, ErrorResponse(err))
+	}
+}
+
+// AdminTestThumbGenerator Tests thumb generator
+func AdminTestThumbGenerator(c *gin.Context) {
+	var service admin.ThumbGeneratorTestService
+	if err := c.ShouldBindJSON(&service); err == nil {
+		res := service.Test(c)
 		c.JSON(200, res)
 	} else {
 		c.JSON(200, ErrorResponse(err))
@@ -178,14 +192,16 @@ func AdminAddSCF(c *gin.Context) {
 	}
 }
 
-// AdminOneDriveOAuth 获取 OneDrive OAuth URL
-func AdminOneDriveOAuth(c *gin.Context) {
-	var service admin.PolicyService
-	if err := c.ShouldBindUri(&service); err == nil {
-		res := service.GetOAuth(c)
-		c.JSON(200, res)
-	} else {
-		c.JSON(200, ErrorResponse(err))
+// AdminOAuthURL 获取 OneDrive OAuth URL
+func AdminOAuthURL(policyType string) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		var service admin.PolicyService
+		if err := c.ShouldBindUri(&service); err == nil {
+			res := service.GetOAuth(c, policyType)
+			c.JSON(200, res)
+		} else {
+			c.JSON(200, ErrorResponse(err))
+		}
 	}
 }
 

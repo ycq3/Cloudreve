@@ -69,6 +69,11 @@ func (fs *FileSystem) Copy(ctx context.Context, dirs, files []uint, src, dst str
 	// 记录复制的文件的总容量
 	var newUsedStorage uint64
 
+	// 设置webdav目标名
+	if dstName, ok := ctx.Value(fsctx.WebdavDstName).(string); ok {
+		dstFolder.WebdavDstName = dstName
+	}
+
 	// 复制目录
 	if len(dirs) > 0 {
 		subFileSizes, err := srcFolder.CopyFolderTo(dirs[0], dstFolder)
@@ -103,6 +108,11 @@ func (fs *FileSystem) Move(ctx context.Context, dirs, files []uint, src, dst str
 		return ErrPathNotExist
 	}
 
+	// 设置webdav目标名
+	if dstName, ok := ctx.Value(fsctx.WebdavDstName).(string); ok {
+		dstFolder.WebdavDstName = dstName
+	}
+
 	// 处理目录及子文件移动
 	err := srcFolder.MoveFolderTo(dirs, dstFolder)
 	if err != nil {
@@ -120,8 +130,9 @@ func (fs *FileSystem) Move(ctx context.Context, dirs, files []uint, src, dst str
 	return err
 }
 
-// Delete 递归删除对象, force 为 true 时强制删除文件记录，忽略物理删除是否成功
-func (fs *FileSystem) Delete(ctx context.Context, dirs, files []uint, force bool) error {
+// Delete 递归删除对象, force 为 true 时强制删除文件记录，忽略物理删除是否成功;
+// unlink 为 true 时只删除虚拟文件系统的文件记录，不删除物理文件。
+func (fs *FileSystem) Delete(ctx context.Context, dirs, files []uint, force, unlink bool) error {
 	// 已删除的文件ID
 	var deletedFiles = make([]*model.File, 0, len(fs.FileTarget))
 	// 删除失败的文件的父目录ID
@@ -155,7 +166,10 @@ func (fs *FileSystem) Delete(ctx context.Context, dirs, files []uint, force bool
 	policyGroup := fs.GroupFileByPolicy(ctx, filesToBeDelete)
 
 	// 按照存储策略分组删除对象
-	failed := fs.deleteGroupedFile(ctx, policyGroup)
+	failed := make(map[uint][]string)
+	if !unlink {
+		failed = fs.deleteGroupedFile(ctx, policyGroup)
+	}
 
 	// 整理删除结果
 	for i := 0; i < len(fs.FileTarget); i++ {
@@ -337,7 +351,6 @@ func (fs *FileSystem) listObjects(ctx context.Context, parent string, files []mo
 			ID:         hashid.HashID(subFolder.ID, hashid.FolderID),
 			Name:       subFolder.Name,
 			Path:       processedPath,
-			Pic:        "",
 			Size:       0,
 			Type:       "dir",
 			Date:       subFolder.UpdatedAt,
@@ -359,7 +372,7 @@ func (fs *FileSystem) listObjects(ctx context.Context, parent string, files []mo
 				ID:            hashid.HashID(file.ID, hashid.FileID),
 				Name:          file.Name,
 				Path:          processedPath,
-				Pic:           file.PicInfo,
+				Thumb:         file.ShouldLoadThumb(),
 				Size:          file.Size,
 				Type:          "file",
 				Date:          file.UpdatedAt,

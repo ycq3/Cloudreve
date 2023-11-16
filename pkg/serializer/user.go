@@ -13,7 +13,7 @@ import (
 func CheckLogin() Response {
 	return Response{
 		Code: CodeCheckLogin,
-		Msg:  "未登录",
+		Msg:  "Login required",
 	}
 }
 
@@ -41,6 +41,8 @@ type group struct {
 	CompressEnabled      bool   `json:"compress"`
 	WebDAVEnabled        bool   `json:"webdav"`
 	SourceBatchSize      int    `json:"sourceBatch"`
+	AdvanceDelete        bool   `json:"advanceDelete"`
+	AllowWebDAVProxy     bool   `json:"allowWebDAVProxy"`
 }
 
 type tag struct {
@@ -99,7 +101,9 @@ func BuildUser(user model.User) User {
 			ShareDownload:        user.Group.OptionsSerialized.ShareDownload,
 			CompressEnabled:      user.Group.OptionsSerialized.ArchiveTask,
 			WebDAVEnabled:        user.Group.WebDAVEnabled,
+			AllowWebDAVProxy:     user.Group.OptionsSerialized.WebDAVProxy,
 			SourceBatchSize:      user.Group.OptionsSerialized.SourceBatchSize,
+			AdvanceDelete:        user.Group.OptionsSerialized.AdvanceDelete,
 		},
 		Tags: buildTagRes(tags),
 	}

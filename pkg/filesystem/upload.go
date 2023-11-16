@@ -69,7 +69,7 @@ func (fs *FileSystem) Upload(ctx context.Context, file *fsctx.FileStream) (err e
 		followUpErr := fs.Trigger(ctx, "AfterValidateFailed", file)
 		// 失败后再失败...
 		if followUpErr != nil {
-			util.Log().Debug("AfterValidateFailed 钩子执行失败，%s", followUpErr)
+			util.Log().Debug("AfterValidateFailed hook execution failed: %s", followUpErr)
 		}
 
 		return err
@@ -113,13 +113,13 @@ func (fs *FileSystem) CancelUpload(ctx context.Context, path string, file fsctx.
 			// 客户端正常关闭，不执行操作
 		default:
 			// 客户端取消上传，删除临时文件
-			util.Log().Debug("客户端取消上传")
+			util.Log().Debug("Client canceled upload.")
 			if fs.Hooks["AfterUploadCanceled"] == nil {
 				return
 			}
 			err := fs.Trigger(ctx, "AfterUploadCanceled", file)
 			if err != nil {
-				util.Log().Debug("执行 AfterUploadCanceled 钩子出错，%s", err)
+				util.Log().Debug("AfterUploadCanceled hook execution failed: %s", err)
 			}
 		}
 
@@ -210,7 +210,6 @@ func (fs *FileSystem) UploadFromStream(ctx context.Context, file *fsctx.FileStre
 		fs.Use("BeforeUpload", HookValidateCapacity)
 		fs.Use("AfterUploadCanceled", HookDeleteTempFile)
 		fs.Use("AfterUpload", GenericAfterUpload)
-		fs.Use("AfterUpload", HookGenerateThumb)
 		fs.Use("AfterValidateFailed", HookDeleteTempFile)
 	}
 	fs.Lock.Unlock()

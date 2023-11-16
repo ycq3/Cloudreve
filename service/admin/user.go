@@ -66,7 +66,7 @@ func (service *UserBatchService) Delete() serializer.Response {
 		if err != nil {
 			return serializer.Err(serializer.CodeInternalSetting, "User's root folder not exist", err)
 		}
-		fs.Delete(context.Background(), []uint{root.ID}, []uint{}, false)
+		fs.Delete(context.Background(), []uint{root.ID}, []uint{}, false, false)
 
 		// 删除相关任务
 		model.DB.Where("user_id = ?", uid).Delete(&model.Download{})
@@ -109,10 +109,16 @@ func (service *AddUserService) Add() serializer.Response {
 		user.Email = service.User.Email
 		user.GroupID = service.User.GroupID
 		user.Status = service.User.Status
+		user.TwoFactor = service.User.TwoFactor
 
 		// 检查愚蠢操作
-		if user.ID == 1 && user.GroupID != 1 {
-			return serializer.Err(serializer.CodeChangeGroupForDefaultUser, "", nil)
+		if user.ID == 1 {
+			if user.GroupID != 1 {
+				return serializer.Err(serializer.CodeChangeGroupForDefaultUser, "", nil)
+			}
+			if user.Status != model.Active {
+				return serializer.Err(serializer.CodeInvalidActionOnDefaultUser, "", nil)
+			}
 		}
 
 		if err := model.DB.Save(&user).Error; err != nil {

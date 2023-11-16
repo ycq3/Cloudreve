@@ -18,6 +18,7 @@ import (
 	"github.com/cloudreve/Cloudreve/v3/pkg/filesystem"
 	"github.com/cloudreve/Cloudreve/v3/pkg/filesystem/fsctx"
 	"github.com/cloudreve/Cloudreve/v3/pkg/serializer"
+	"github.com/cloudreve/Cloudreve/v3/pkg/wopi"
 	"github.com/gin-gonic/gin"
 )
 
@@ -178,12 +179,13 @@ func (service *FileAnonymousGetService) Source(ctx context.Context, c *gin.Conte
 	}
 
 	// 获取文件流
-	res, err := fs.SignURL(ctx, &fs.FileTarget[0],
-		int64(model.GetIntSetting("preview_timeout", 60)), false)
+	ttl := int64(model.GetIntSetting("preview_timeout", 60))
+	res, err := fs.SignURL(ctx, &fs.FileTarget[0], ttl, false)
 	if err != nil {
 		return serializer.Err(serializer.CodeNotSet, err.Error(), err)
 	}
 
+	c.Header("Cache-Control", fmt.Sprintf("max-age=%d", ttl))
 	return serializer.Response{
 		Code: -302,
 		Data: res,
@@ -191,7 +193,7 @@ func (service *FileAnonymousGetService) Source(ctx context.Context, c *gin.Conte
 }
 
 // CreateDocPreviewSession 创建DOC文件预览会话，返回预览地址
-func (service *FileIDService) CreateDocPreviewSession(ctx context.Context, c *gin.Context) serializer.Response {
+func (service *FileIDService) CreateDocPreviewSession(ctx context.Context, c *gin.Context, editable bool) serializer.Response {
 	// 创建文件系统
 	fs, err := filesystem.NewFileSystemFromContext(c)
 	if err != nil {
@@ -225,16 +227,57 @@ func (service *FileIDService) CreateDocPreviewSession(ctx context.Context, c *gi
 		return serializer.Err(serializer.CodeNotSet, err.Error(), err)
 	}
 
+	// For newer version of Cloudreve - Local Policy
+	// When do not use a cdn, the downloadURL withouts hosts, like "/api/v3/file/download/xxx"
+	if strings.HasPrefix(downloadURL, "/") {
+		downloadURI, err := url.Parse(downloadURL)
+		if err != nil {
+			return serializer.Err(serializer.CodeNotSet, err.Error(), err)
+		}
+		downloadURL = model.GetSiteURL().ResolveReference(downloadURI).String()
+	}
+
+	var resp serializer.DocPreviewSession
+
+	// Use WOPI preview if available
+	if model.IsTrueVal(model.GetSettingByName("wopi_enabled")) && wopi.Default != nil {
+		maxSize := model.GetIntSetting("maxEditSize", 0)
+		if maxSize > 0 && fs.FileTarget[0].Size > uint64(maxSize) {
+			return serializer.Err(serializer.CodeFileTooLarge, "", nil)
+		}
+
+		action := wopi.ActionPreview
+		if editable {
+			action = wopi.ActionEdit
+		}
+
+		session, err := wopi.Default.NewSession(fs.FileTarget[0].UserID, &fs.FileTarget[0], action)
+		if err != nil {
+			return serializer.Err(serializer.CodeInternalSetting, "Failed to create WOPI session", err)
+		}
+
+		resp.URL = session.ActionURL.String()
+		resp.AccessTokenTTL = session.AccessTokenTTL
+		resp.AccessToken = session.AccessToken
+		return serializer.Response{
+			Code: 0,
+			Data: resp,
+		}
+	}
+
 	// 生成最终的预览器地址
 	srcB64 := base64.StdEncoding.EncodeToString([]byte(downloadURL))
 	srcEncoded := url.QueryEscape(downloadURL)
 	srcB64Encoded := url.QueryEscape(srcB64)
+	resp.URL = util.Replace(map[string]string{
+		"{$src}":    srcEncoded,
+		"{$srcB64}": srcB64Encoded,
+		"{$name}":   url.QueryEscape(fs.FileTarget[0].Name),
+	}, model.GetSettingByName("office_preview_service"))
+
 	return serializer.Response{
 		Code: 0,
-		Data: util.Replace(map[string]string{
-			"{$src}":    srcEncoded,
-			"{$srcB64}": srcB64Encoded,
-		}, model.GetSettingByName("office_preview_service")),
+		Data: resp,
 	}
 }
 
@@ -375,7 +418,7 @@ func (service *FileIDService) PutContent(ctx context.Context, c *gin.Context) se
 	}
 
 	fileData := fsctx.FileStream{
-		MIMEType: c.Request.Header.Get("Content-Type"),
+		MimeType: c.Request.Header.Get("Content-Type"),
 		File:     c.Request.Body,
 		Size:     fileSize,
 		Mode:     fsctx.Overwrite,
@@ -404,18 +447,18 @@ func (service *FileIDService) PutContent(ctx context.Context, c *gin.Context) se
 		fileData.Mode &= ^fsctx.Overwrite
 		fs.Use("AfterUpload", filesystem.HookUpdateSourceName)
 		fs.Use("AfterUploadCanceled", filesystem.HookUpdateSourceName)
+		fs.Use("AfterUploadCanceled", filesystem.HookCleanFileContent)
+		fs.Use("AfterUploadCanceled", filesystem.HookClearFileSize)
 		fs.Use("AfterValidateFailed", filesystem.HookUpdateSourceName)
+		fs.Use("AfterValidateFailed", filesystem.HookCleanFileContent)
+		fs.Use("AfterValidateFailed", filesystem.HookClearFileSize)
 	}
 
 	// 给文件系统分配钩子
 	fs.Use("BeforeUpload", filesystem.HookResetPolicy)
 	fs.Use("BeforeUpload", filesystem.HookValidateFile)
 	fs.Use("BeforeUpload", filesystem.HookValidateCapacityDiff)
-	fs.Use("AfterUploadCanceled", filesystem.HookCleanFileContent)
-	fs.Use("AfterUploadCanceled", filesystem.HookClearFileSize)
 	fs.Use("AfterUpload", filesystem.GenericAfterUpdate)
-	fs.Use("AfterValidateFailed", filesystem.HookCleanFileContent)
-	fs.Use("AfterValidateFailed", filesystem.HookClearFileSize)
 
 	// 执行上传
 	uploadCtx = context.WithValue(uploadCtx, fsctx.FileModelCtx, originFile[0])
@@ -442,22 +485,46 @@ func (s *ItemIDService) Sources(ctx context.Context, c *gin.Context) serializer.
 	}
 
 	res := make([]serializer.Sources, 0, len(s.Raw().Items))
-	for _, id := range s.Raw().Items {
-		fs.FileTarget = []model.File{}
-		sourceURL, err := fs.GetSource(ctx, id)
-		if len(fs.FileTarget) > 0 {
-			current := serializer.Sources{
-				URL:    sourceURL,
-				Name:   fs.FileTarget[0].Name,
-				Parent: fs.FileTarget[0].FolderID,
-			}
+	files, err := model.GetFilesByIDs(s.Raw().Items, fs.User.ID)
+	if err != nil || len(files) == 0 {
+		return serializer.Err(serializer.CodeFileNotFound, "", err)
+	}
 
+	getSourceFunc := func(file model.File) (string, error) {
+		fs.FileTarget = []model.File{file}
+		return fs.GetSource(ctx, file.ID)
+	}
+
+	// Create redirected source link if needed
+	if fs.User.Group.OptionsSerialized.RedirectedSource {
+		getSourceFunc = func(file model.File) (string, error) {
+			source, err := file.CreateOrGetSourceLink()
 			if err != nil {
-				current.Error = err.Error()
+				return "", err
 			}
 
-			res = append(res, current)
+			sourceLinkURL, err := source.Link()
+			if err != nil {
+				return "", err
+			}
+
+			return sourceLinkURL, nil
 		}
+	}
+
+	for _, file := range files {
+		sourceURL, err := getSourceFunc(file)
+		current := serializer.Sources{
+			URL:    sourceURL,
+			Name:   file.Name,
+			Parent: file.FolderID,
+		}
+
+		if err != nil {
+			current.Error = err.Error()
+		}
+
+		res = append(res, current)
 	}
 
 	return serializer.Response{

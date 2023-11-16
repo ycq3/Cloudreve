@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/http/httputil"
 	"net/url"
 	"path"
 	"strconv"
@@ -218,7 +219,7 @@ func (h *Handler) confirmLocks(r *http.Request, src, dst string, fs *filesystem.
 	}, 0, nil
 }
 
-//OK
+// OK
 func (h *Handler) handleOptions(w http.ResponseWriter, r *http.Request, fs *filesystem.FileSystem) (status int, err error) {
 	reqPath, status, err := h.stripPrefix(r.URL.Path, fs.User.ID)
 	if err != nil {
@@ -239,6 +240,23 @@ func (h *Handler) handleOptions(w http.ResponseWriter, r *http.Request, fs *file
 	// http://msdn.microsoft.com/en-au/library/cc250217.aspx
 	w.Header().Set("MS-Author-Via", "DAV")
 	return 0, nil
+}
+
+var proxy = &httputil.ReverseProxy{
+	Director: func(request *http.Request) {
+		if target, ok := request.Context().Value(fsctx.WebDAVProxyUrlCtx).(*url.URL); ok {
+			request.URL.Scheme = target.Scheme
+			request.URL.Host = target.Host
+			request.URL.Path = target.Path
+			request.URL.RawPath = target.RawPath
+			request.URL.RawQuery = target.RawQuery
+			request.Host = target.Host
+			request.Header.Del("Authorization")
+		}
+	},
+	ErrorHandler: func(writer http.ResponseWriter, request *http.Request, err error) {
+		writer.WriteHeader(http.StatusInternalServerError)
+	},
 }
 
 // OK
@@ -279,7 +297,23 @@ func (h *Handler) handleGetHeadPost(w http.ResponseWriter, r *http.Request, fs *
 		return 0, nil
 	}
 
-	http.Redirect(w, r, rs.URL, 301)
+	if application, ok := r.Context().Value(fsctx.WebDAVCtx).(*model.Webdav); ok && application.UseProxy {
+		target, err := url.Parse(rs.URL)
+		if err != nil {
+			return http.StatusInternalServerError, err
+		}
+
+		r = r.Clone(context.WithValue(r.Context(), fsctx.WebDAVProxyUrlCtx, target))
+		// 忽略反向代理在传输错误时报错
+		defer func() {
+			if err := recover(); err != nil && err != http.ErrAbortHandler {
+				panic(err)
+			}
+		}()
+		proxy.ServeHTTP(w, r)
+	} else {
+		http.Redirect(w, r, rs.URL, 301)
+	}
 
 	return 0, nil
 }
@@ -303,7 +337,7 @@ func (h *Handler) handleDelete(w http.ResponseWriter, r *http.Request, fs *files
 
 	// 尝试作为文件删除
 	if ok, file := fs.IsFileExist(reqPath); ok {
-		if err := fs.Delete(ctx, []uint{}, []uint{file.ID}, false); err != nil {
+		if err := fs.Delete(ctx, []uint{}, []uint{file.ID}, false, false); err != nil {
 			return http.StatusMethodNotAllowed, err
 		}
 		return http.StatusNoContent, nil
@@ -311,7 +345,7 @@ func (h *Handler) handleDelete(w http.ResponseWriter, r *http.Request, fs *files
 
 	// 尝试作为目录删除
 	if ok, folder := fs.IsPathExist(reqPath); ok {
-		if err := fs.Delete(ctx, []uint{folder.ID}, []uint{}, false); err != nil {
+		if err := fs.Delete(ctx, []uint{folder.ID}, []uint{}, false, false); err != nil {
 			return http.StatusMethodNotAllowed, err
 		}
 		return http.StatusNoContent, nil
@@ -345,7 +379,7 @@ func (h *Handler) handlePut(w http.ResponseWriter, r *http.Request, fs *filesyst
 	fileName := path.Base(reqPath)
 	filePath := path.Dir(reqPath)
 	fileData := fsctx.FileStream{
-		MIMEType:    r.Header.Get("Content-Type"),
+		MimeType:    r.Header.Get("Content-Type"),
 		File:        r.Body,
 		Size:        fileSize,
 		Name:        fileName,
@@ -386,9 +420,11 @@ func (h *Handler) handlePut(w http.ResponseWriter, r *http.Request, fs *filesyst
 		fs.Use("AfterUploadCanceled", filesystem.HookDeleteTempFile)
 		fs.Use("AfterUploadCanceled", filesystem.HookCancelContext)
 		fs.Use("AfterUpload", filesystem.GenericAfterUpload)
-		fs.Use("AfterUpload", filesystem.HookGenerateThumb)
 		fs.Use("AfterValidateFailed", filesystem.HookDeleteTempFile)
 	}
+
+	// rclone 请求
+	fs.Use("AfterUpload", filesystem.NewWebdavAfterUploadHook(r))
 
 	// 执行上传
 	err = fs.Upload(ctx, &fileData)
@@ -494,7 +530,16 @@ func (h *Handler) handleCopyMove(w http.ResponseWriter, r *http.Request, fs *fil
 				return http.StatusBadRequest, errInvalidDepth
 			}
 		}
-		return copyFiles(ctx, fs, target, dst, r.Header.Get("Overwrite") != "F", depth, 0)
+		status, err = copyFiles(ctx, fs, target, dst, r.Header.Get("Overwrite") != "F", depth, 0)
+		if err != nil {
+			return status, err
+		}
+
+		err = updateCopyMoveModtime(r, fs, dst)
+		if err != nil {
+			return http.StatusInternalServerError, err
+		}
+		return status, nil
 	}
 
 	// windows下，某些情况下（网盘根目录下）Office保存文件时附带的锁token只包含源文件，
@@ -513,7 +558,16 @@ func (h *Handler) handleCopyMove(w http.ResponseWriter, r *http.Request, fs *fil
 			return http.StatusBadRequest, errInvalidDepth
 		}
 	}
-	return moveFiles(ctx, fs, target, dst, r.Header.Get("Overwrite") == "T")
+	status, err = moveFiles(ctx, fs, target, dst, r.Header.Get("Overwrite") == "T")
+	if err != nil {
+		return status, err
+	}
+
+	err = updateCopyMoveModtime(r, fs, dst)
+	if err != nil {
+		return http.StatusInternalServerError, err
+	}
+	return status, nil
 }
 
 // OK
@@ -783,10 +837,11 @@ const (
 // infiniteDepth. Parsing any other string returns invalidDepth.
 //
 // Different WebDAV methods have further constraints on valid depths:
-//	- PROPFIND has no further restrictions, as per section 9.1.
-//	- COPY accepts only "0" or "infinity", as per section 9.8.3.
-//	- MOVE accepts only "infinity", as per section 9.9.2.
-//	- LOCK accepts only "0" or "infinity", as per section 9.10.3.
+//   - PROPFIND has no further restrictions, as per section 9.1.
+//   - COPY accepts only "0" or "infinity", as per section 9.8.3.
+//   - MOVE accepts only "infinity", as per section 9.9.2.
+//   - LOCK accepts only "0" or "infinity", as per section 9.10.3.
+//
 // These constraints are enforced by the handleXxx methods.
 func parseDepth(s string) int {
 	switch s {
